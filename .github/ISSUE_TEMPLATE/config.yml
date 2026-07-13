@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a problem with R Observatory
+    url: https://github.com/r-observatory/feedback/issues/new/choose
+    about: Bugs, data problems, feature requests, and questions are all tracked in one place.
+  - name: R Observatory
+    url: https://r-observatory.thecoatlessprofessor.com/
+    about: The site itself.
+  - name: Email support
+    url: mailto:support@caffeinatedmath.com
+    about: For private support requests and security reports.
