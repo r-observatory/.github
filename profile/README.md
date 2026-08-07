@@ -41,6 +41,11 @@ One repo per channel, each publishing per-package counts.
 - [rpkg-analyzer](https://github.com/r-observatory/rpkg-analyzer), a hermetic static analyzer for R package source trees
 - [robservatory](https://github.com/r-observatory/robservatory), shared utilities used across the pipelines
 
+## Citing
+
+How to cite the site, and the packages it measures:
+[how to cite](https://r-observatory.thecoatlessprofessor.com/about/cite).
+
 ## Feedback
 
 Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
