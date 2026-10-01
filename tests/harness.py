@@ -1,5 +1,7 @@
 """Shared set-up: the script under test, a fake gh on PATH, a fixed clock and no real sleeping."""
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import shutil
@@ -15,6 +17,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 import archive_ci_logs as acl  # noqa: E402
 
 REPO = "r-observatory/demo"
+HOME = "r-observatory/ci-logs"
+AMBIENT, READ, WRITE = "ambient-token", "read-token", "write-token"
 
 
 def at(s):
@@ -53,9 +57,10 @@ class Harness(unittest.TestCase):
         os.makedirs(self.store)
         self.work = os.path.join(self.tmp, "work")
         env = mock.patch.dict(os.environ, {"PATH": bin_dir + os.pathsep + os.environ["PATH"],
-                                           "FAKE_GH_STATE": self.state_path})
+                                           "FAKE_GH_STATE": self.state_path, "GH_TOKEN": AMBIENT})
         env.start()
         self.addCleanup(env.stop)
+        os.environ.pop(acl.READ_TOKEN, None)
         self.now = at("2026-10-06T03:41:00Z")
         self.slept = []
         for name, value in (("utcnow", lambda: self.now), ("sleep", self.on_sleep)):
@@ -83,6 +88,36 @@ class Harness(unittest.TestCase):
 
     def calls(self, *prefix):
         return [c for c in self.state().get("calls", []) if c[:len(prefix)] == list(prefix)]
+
+    def two_tokens(self, **auth):
+        """As in the central workflow: logs answer only READ, releases and the enable only WRITE."""
+        env = mock.patch.dict(os.environ, {"GH_TOKEN": WRITE, acl.READ_TOKEN: READ})
+        env.start()
+        self.addCleanup(env.stop)
+        self.put(auth=dict({"read": READ, "write": WRITE}, **auth))
+
+    def tokens_of(self, fragment):
+        """The tokens carried by the calls that have `fragment` in any argument."""
+        state = self.state()
+        return {t for c, t in zip(state.get("calls", []), state.get("tokens", []))
+                if any(fragment in part for part in c)}
+
+    def central(self, **sources):
+        """Further source repositories, archived into one release per source in HOME."""
+        self.put(release_repo=HOME, sources={f"r-observatory/{name}": {"runs": runs}
+                                              for name, runs in sources.items()})
+
+    def stored(self, tag):
+        path = os.path.join(self.store, tag)
+        return sorted(os.listdir(path)) if os.path.isdir(path) else []
+
+    def run_main(self, *argv):
+        """(exit code, the ::error:: lines, every printed line) of one command."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = acl.main(list(argv))
+        lines = out.getvalue().splitlines()
+        return code, [line for line in lines if line.startswith("::error::")], lines
 
     def collect(self, month="2026-08", cache=None):
         return acl.collect_month(REPO, month, self.work, acl.Budget(), cache)

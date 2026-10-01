@@ -105,8 +105,8 @@ class Archive(Harness):
         self.put(runs=[run(1, "2026-08-02T06:00:00Z"), run(2, "2026-09-02T06:00:00Z")])
         ensure = acl.ensure_release
 
-        def then_deleted(repo, budget):
-            ensure(repo, budget)
+        def then_deleted(*args):
+            ensure(*args)
             self.put(release=None)
 
         out = io.StringIO()
