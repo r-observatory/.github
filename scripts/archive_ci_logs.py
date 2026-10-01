@@ -551,3 +551,112 @@ def settle_month(repo, month, work_dir, budget, now, produce):
         return False
     tar_path, tsv_path = produce(month)
     return publish_month(repo, month, tar_path, tsv_path, now, budget) in ("uploaded", "archived")
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_archive(a):
+    now = utcnow()
+    months = check_months(a.month, now) if a.month else months_due(now)
+    late = sorted(set(months) - set(months_due(now)))
+    if late:
+        # A month whose first days are already gone is built from a local copy instead.
+        raise UsageError(f"{', '.join(late)}: its earliest logs are past retention; "
+                         "use build with a local copy, then upload")
+    budget = Budget()
+    ensure_release(a.repo, budget)
+
+    def produce(month):
+        rows = collect_month(a.repo, month, a.work_dir, budget)
+        print(summary(month, rows), flush=True)
+        return write_pair(month, rows, a.work_dir)
+
+    ok = True
+    for month in months:
+        try:
+            ok &= settle_month(a.repo, month, a.work_dir, budget, now, produce)
+        except (GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+            print(f"::error::{month}: {e}", flush=True)
+            ok = False
+    return 0 if ok else 1
+
+
+def cmd_build(a):
+    now = utcnow()
+    months = check_months(a.month, now)
+    if not months:
+        raise UsageError("build needs at least one --month")
+    budget, cache, errors = Budget(), cache_index(a.cache_dir), 0
+    for month in months:
+        rows = collect_month(a.repo, month, a.work_dir, budget, cache)
+        verify_pair(*write_pair(month, rows, a.work_dir))
+        print(summary(month, rows), flush=True)
+        errors += sum(r["outcome"] == "error" for r in rows)
+    return 1 if errors else 0
+
+
+def cmd_upload(a):
+    now = utcnow()
+    months = check_months(a.month, now)
+    if not months:
+        raise UsageError("upload needs at least one --month")
+    budget = Budget()
+    ensure_release(a.repo, budget)
+
+    def produce(month):
+        paths = [os.path.join(a.work_dir, month, n) for n in pair_names(month)]
+        if not all(os.path.exists(p) for p in paths):
+            raise RuntimeError(f"no built pair for {month} in {a.work_dir}")
+        return paths
+
+    ok = True
+    for month in months:
+        try:
+            ok &= settle_month(a.repo, month, a.work_dir, budget, now, produce)
+        except (GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+            print(f"::error::{month}: {e}", flush=True)
+            ok = False
+    return 0 if ok else 1
+
+
+def cmd_keepalive(a):
+    """Re-enabling a workflow restarts GitHub's 60-day inactivity clock for it."""
+    path = a.workflow_ref.split("@", 1)[0]
+    prefix = f"{a.repo}/.github/workflows/"
+    name = path[len(prefix):] if path.startswith(prefix) else ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.ya?ml", name):
+        raise UsageError(f"{a.workflow_ref!r} is not a workflow of {a.repo}")
+    with_retries(lambda: gh(["api", "-X", "PUT", f"repos/{a.repo}/actions/workflows/{name}/enable"]),
+                 Budget())
+    print(f"re-enabled {name}", flush=True)
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("archive", "build", "upload"):
+        s = sub.add_parser(name)
+        s.add_argument("--repo", required=True, help="owner/name")
+        s.add_argument("--month", action="append", default=[], help="YYYY-MM; repeatable")
+        s.add_argument("--work-dir", required=True)
+        if name == "build":
+            s.add_argument("--cache-dir", help="zips saved earlier as <created>_<run id>_<workflow>.zip")
+    k = sub.add_parser("keepalive")
+    k.add_argument("--repo", required=True)
+    k.add_argument("--workflow-ref", required=True)
+    a = p.parse_args(argv)
+    commands = {"archive": cmd_archive, "build": cmd_build, "upload": cmd_upload,
+                "keepalive": cmd_keepalive}
+    try:
+        return commands[a.command](a)
+    except UsageError as e:
+        print(f"::error::{e}", flush=True)
+        return 2
+    except (GhError, RuntimeError, ValueError, OSError) as e:
+        print(f"::error::{e}", flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
