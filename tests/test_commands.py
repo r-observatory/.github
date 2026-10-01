@@ -3,8 +3,9 @@ import io
 import os
 import tarfile
 import unittest
+from unittest import mock
 
-from harness import REPO, Harness, a_zip, at, dir_entry, run
+from harness import REPO, Harness, a_zip, acl, at, dir_entry, run
 
 AUG = ("ci-logs-2026-08.tar", "ci-logs-2026-08.tsv")
 SEP = ("ci-logs-2026-09.tar", "ci-logs-2026-09.tsv")
@@ -99,6 +100,27 @@ class Archive(Harness):
         self.lone_august_tar(info, io.BytesIO(b"x"))
 
         self.assert_august_refused_and_september_archived()
+
+    def test_a_release_deleted_during_the_run_is_an_error_for_each_month(self):
+        self.put(runs=[run(1, "2026-08-02T06:00:00Z"), run(2, "2026-09-02T06:00:00Z")])
+        ensure = acl.ensure_release
+
+        def then_deleted(repo, budget):
+            ensure(repo, budget)
+            self.put(release=None)
+
+        out = io.StringIO()
+
+        with mock.patch.object(acl, "ensure_release", then_deleted), contextlib.redirect_stdout(out):
+            code = self.archive()
+
+        self.assertEqual(code, 1)
+        errors = [line for line in out.getvalue().splitlines() if line.startswith("::error::")]
+        self.assertEqual(len(errors), 2)
+        self.assertIn("::error::2026-08: release ci-logs was not found", errors[0])
+        self.assertIn("::error::2026-09: release ci-logs was not found", errors[1])
+        self.assertEqual(len(self.calls("release", "create")), 1)
+        self.assertEqual(self.calls("release", "upload"), [])
 
     def test_a_budget_that_cannot_be_read_stops_the_run_and_says_why(self):
         self.put(runs=[run(i, f"2026-08-02T06:{i:02d}:00Z") for i in range(1, 31)]

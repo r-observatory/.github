@@ -497,6 +497,14 @@ def ensure_release(repo, budget):
     return state
 
 
+def release_assets(repo, budget):
+    """The assets of the release the run found or created when it began."""
+    state = release_state(repo, budget)
+    if state is None:
+        raise RuntimeError(f"release {TAG} was not found; it was there when the run began")
+    return state["assets"]
+
+
 def month_status(assets, month):
     names = pair_names(month)
     if any(n in assets and assets[n] != "uploaded" for n in names):
@@ -550,7 +558,7 @@ def publish_month(repo, month, tar_path, tsv_path, now, budget):
         print(f"::error::{month}: {errors} attempts failed to download; the month waits until "
               f"they do or until day {UPLOAD_ANYWAY_DAY}", flush=True)
         return "held"
-    if month_status(release_state(repo, budget)["assets"], month) != "absent":
+    if month_status(release_assets(repo, budget), month) != "absent":
         print(f"{month}: archived by another upload meanwhile; this pair is not uploaded", flush=True)
         return "archived"
     upload_asset(repo, tar_path, budget)
@@ -564,7 +572,7 @@ def publish_month(repo, month, tar_path, tsv_path, now, budget):
 
 def settle_month(repo, month, work_dir, budget, now, produce):
     """Bring one month to archived; False when it needs another run or a hand."""
-    status = month_status(release_state(repo, budget)["assets"], month)
+    status = month_status(release_assets(repo, budget), month)
     if status == "archived":
         print(f"{month}: already archived", flush=True)
         return True

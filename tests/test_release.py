@@ -57,6 +57,14 @@ class Release(Harness):
         self.assertEqual(got, "archived")
         self.assertEqual(self.calls("release", "upload"), [])
 
+    def test_a_release_that_is_gone_before_the_upload_is_an_error(self):
+        self.put(runs=[run(1, "2026-08-02T06:00:00Z")])
+        tar_path, tsv_path = acl.write_pair("2026-08", self.collect(), self.work)
+
+        with self.assertRaisesRegex(RuntimeError, "release ci-logs was not found"):
+            acl.publish_month(REPO, "2026-08", tar_path, tsv_path, self.now, acl.Budget())
+        self.assertEqual(self.calls("release", "upload"), [])
+
     def test_assets_are_read_past_the_first_page(self):
         names = [f"ci-logs-{2020 + i // 24}-{i // 2 % 12 + 1:02d}.{'tar' if i % 2 == 0 else 'tsv'}"
                  for i in range(130)]
