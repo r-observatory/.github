@@ -350,3 +350,84 @@ def collect_month(repo, month, work_dir, budget, cache=None):
                 row["zip_bytes"], row["zip_sha256"] = file_digest(dest)
             rows.append(row)
     return rows
+
+
+# --- the monthly pair -------------------------------------------------------
+
+def pair_names(month):
+    return f"ci-logs-{month}.tar", f"ci-logs-{month}.tsv"
+
+
+def tsv_bytes(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter="\t", lineterminator="\n")
+    w.writerow(COLUMNS)
+    for r in rows:
+        w.writerow([r[c] for c in COLUMNS])
+    return buf.getvalue().encode("utf-8")
+
+
+def read_index(data):
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8")), delimiter="\t")
+    if reader.fieldnames != COLUMNS:
+        raise ValueError(f"index columns are {reader.fieldnames}")
+    return list(reader)
+
+
+def plain(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mode = 0o644
+    return info
+
+
+def write_pair(month, rows, work_dir):
+    base = os.path.join(work_dir, month)
+    tar_path, tsv_path = (os.path.join(base, n) for n in pair_names(month))
+    index = tsv_bytes(rows)
+    with open(tsv_path, "wb") as f:
+        f.write(index)
+    with tarfile.open(tar_path + ".part", "w", format=tarfile.PAX_FORMAT) as tar:
+        info = plain(tarfile.TarInfo("index.tsv"))
+        info.size, info.mtime = len(index), int(utcnow().timestamp())
+        tar.addfile(info, io.BytesIO(index))
+        for r in rows:
+            if r["outcome"] == "ok":
+                name = member_name(r)
+                tar.add(os.path.join(base, "zips", name), arcname=name, filter=plain)
+    os.replace(tar_path + ".part", tar_path)
+    return tar_path, tsv_path
+
+
+def verify_pair(tar_path, tsv_path):
+    """The rows of a pair whose tar holds the same index and exactly the zips it lists."""
+    with open(tsv_path, "rb") as f:
+        index = f.read()
+    rows = read_index(index)
+    with tarfile.open(tar_path) as tar:
+        members = {m.name: m for m in tar.getmembers()}
+        if "index.tsv" not in members or tar.extractfile(members["index.tsv"]).read() != index:
+            raise ValueError(f"{os.path.basename(tar_path)} does not carry this index")
+        listed = {"index.tsv"}
+        for r in rows:
+            if r["outcome"] != "ok":
+                continue
+            name = member_name(r)
+            if name not in members:
+                raise ValueError(f"{name} is in the index but not in the tar")
+            data = tar.extractfile(members[name]).read()
+            if len(data) != int(r["zip_bytes"]) or hashlib.sha256(data).hexdigest() != r["zip_sha256"]:
+                raise ValueError(f"{name} does not match its size and sha256")
+            listed.add(name)
+        extra = sorted(set(members) - listed)
+        if extra:
+            raise ValueError(f"the tar holds files the index does not list: {extra[:3]}")
+    return rows
+
+
+def summary(month, rows):
+    n = {k: sum(r["outcome"] == k for r in rows) for k in ("ok", "gone", "error")}
+    runs = len({r["run_id"] for r in rows})
+    mb = sum(int(r["zip_bytes"] or 0) for r in rows) / 1e6
+    return (f"{month}: {runs} runs, {len(rows)} attempts: {n['ok']} ok, {n['gone']} gone, "
+            f"{n['error']} error, {mb:.1f} MB")
