@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -30,6 +31,12 @@ def run(rid, created, attempt=1, name="Update", conclusion="success", updated=No
 def a_zip(path, text="saved earlier\n"):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("1_build.txt", text)
+
+
+def dir_entry(name):
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    return info
 
 
 class Harness(unittest.TestCase):

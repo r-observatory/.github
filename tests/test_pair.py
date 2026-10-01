@@ -1,8 +1,9 @@
+import io
 import os
 import tarfile
 import unittest
 
-from harness import Harness, acl, run
+from harness import Harness, acl, dir_entry, run
 
 
 class Pair(Harness):
@@ -48,6 +49,32 @@ class Pair(Harness):
         with tarfile.open(tar_path, "a") as tar:
             tar.add(tsv_path, arcname="stray.zip")
         with self.assertRaisesRegex(ValueError, "does not list"):
+            acl.verify_pair(tar_path, tsv_path)
+
+    def as_directory(self, tar_path, name):
+        """Rewrite the tar with the member `name` as a directory entry."""
+        with tarfile.open(tar_path) as tar:
+            members = [(m, tar.extractfile(m).read()) for m in tar.getmembers()]
+        with tarfile.open(tar_path, "w") as tar:
+            for m, data in members:
+                if m.name == name:
+                    tar.addfile(dir_entry(name))
+                else:
+                    tar.addfile(m, io.BytesIO(data))
+
+    def test_a_tar_whose_index_is_a_directory_entry_is_refused(self):
+        tar_path, tsv_path = self.build()
+        self.as_directory(tar_path, "index.tsv")
+
+        with self.assertRaisesRegex(ValueError, "does not carry this index"):
+            acl.verify_pair(tar_path, tsv_path)
+
+    def test_a_tar_whose_listed_zip_is_a_directory_entry_is_refused(self):
+        tar_path, tsv_path = self.build()
+        name = "2026-08-02T060000_1_a2_update_success.zip"
+        self.as_directory(tar_path, name)
+
+        with self.assertRaisesRegex(ValueError, f"{name} is not a regular file in the tar"):
             acl.verify_pair(tar_path, tsv_path)
 
     def test_an_empty_month_is_still_a_pair(self):

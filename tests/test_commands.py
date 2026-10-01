@@ -4,7 +4,7 @@ import os
 import tarfile
 import unittest
 
-from harness import REPO, Harness, a_zip, at, run
+from harness import REPO, Harness, a_zip, at, dir_entry, run
 
 AUG = ("ci-logs-2026-08.tar", "ci-logs-2026-08.tsv")
 SEP = ("ci-logs-2026-09.tar", "ci-logs-2026-09.tsv")
@@ -66,6 +66,39 @@ class Archive(Harness):
             inner = tar.extractfile("index.tsv").read()
         with open(os.path.join(self.store, AUG[1]), "rb") as f:
             self.assertEqual(f.read(), inner)
+
+    def lone_august_tar(self, info, data=None):
+        """A tar the script did not write, alone on the release under August's name."""
+        with tarfile.open(os.path.join(self.store, AUG[0]), "w") as tar:
+            tar.addfile(info, data)
+        self.put(release={"id": 7, "assets": [{"name": AUG[0], "state": "uploaded"}]},
+                 runs=[run(2, "2026-09-02T06:00:00Z")])
+
+    def assert_august_refused_and_september_archived(self):
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            code = self.archive()
+
+        self.assertEqual(code, 1)
+        errors = [line for line in out.getvalue().splitlines() if line.startswith("::error::")]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("::error::2026-08: ci-logs-2026-08.tar on the release has no index.tsv file",
+                      errors[0])
+        self.assertEqual([os.path.basename(c[3]) for c in self.calls("release", "upload")], list(SEP))
+        self.assertEqual(sorted(os.listdir(self.store)), sorted((AUG[0],) + SEP))
+
+    def test_a_lone_tar_whose_index_is_a_directory_entry_is_refused_and_the_next_month_archives(self):
+        self.lone_august_tar(dir_entry("index.tsv"))
+
+        self.assert_august_refused_and_september_archived()
+
+    def test_a_lone_tar_without_an_index_is_refused_and_the_next_month_archives(self):
+        info = tarfile.TarInfo("other.txt")
+        info.size = 1
+        self.lone_august_tar(info, io.BytesIO(b"x"))
+
+        self.assert_august_refused_and_september_archived()
 
     def test_a_budget_that_cannot_be_read_stops_the_run_and_says_why(self):
         self.put(runs=[run(i, f"2026-08-02T06:{i:02d}:00Z") for i in range(1, 31)]

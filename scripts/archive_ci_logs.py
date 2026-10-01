@@ -415,6 +415,13 @@ def write_pair(month, rows, work_dir):
     return tar_path, tsv_path
 
 
+def file_bytes(tar, member):
+    """What a regular file in the tar holds; None for a missing member or any other entry."""
+    if member is None or not member.isfile():
+        return None
+    return tar.extractfile(member).read()
+
+
 def verify_pair(tar_path, tsv_path):
     """The rows of a pair whose tar holds the same index and exactly the zips it lists."""
     with open(tsv_path, "rb") as f:
@@ -422,7 +429,7 @@ def verify_pair(tar_path, tsv_path):
     rows = read_index(index)
     with tarfile.open(tar_path) as tar:
         members = {m.name: m for m in tar.getmembers()}
-        if "index.tsv" not in members or tar.extractfile(members["index.tsv"]).read() != index:
+        if file_bytes(tar, members.get("index.tsv")) != index:
             raise ValueError(f"{os.path.basename(tar_path)} does not carry this index")
         listed = {"index.tsv"}
         for r in rows:
@@ -431,7 +438,9 @@ def verify_pair(tar_path, tsv_path):
             name = member_name(r)
             if name not in members:
                 raise ValueError(f"{name} is in the index but not in the tar")
-            data = tar.extractfile(members[name]).read()
+            data = file_bytes(tar, members[name])
+            if data is None:
+                raise ValueError(f"{name} is not a regular file in the tar")
             if len(data) != int(r["zip_bytes"]) or hashlib.sha256(data).hexdigest() != r["zip_sha256"]:
                 raise ValueError(f"{name} does not match its size and sha256")
             listed.add(name)
@@ -524,7 +533,9 @@ def repair_tsv(repo, month, work_dir, budget):
                              "--dir", base, "--clobber"]), budget)
     tar_path, tsv_path = os.path.join(base, tar_name), os.path.join(base, tsv_name)
     with tarfile.open(tar_path) as tar:
-        index = tar.extractfile("index.tsv").read()
+        index = file_bytes(tar, {m.name: m for m in tar.getmembers()}.get("index.tsv"))
+    if index is None:
+        raise ValueError(f"{tar_name} on the release has no index.tsv file")
     with open(tsv_path, "wb") as f:
         f.write(index)
     verify_pair(tar_path, tsv_path)
