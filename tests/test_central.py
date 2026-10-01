@@ -333,7 +333,7 @@ class AccessCheck(Harness):
         self.assertEqual(len(self.api_calls("runs/3/attempts/1/logs")), 1)
         self.assertEqual(len(self.api_calls("/logs")), 3)
         self.assertEqual(sorted(os.listdir(self.store)), sorted(AUG + SEP))
-        self.assertEqual(os.listdir(self.work), ["2026-08", "2026-09"])
+        self.assertEqual(sorted(os.listdir(self.work)), ["2026-08", "2026-09"])
 
     def test_a_newest_log_that_is_gone_falls_to_the_next_run(self):
         self.put(logs={"3/1": {"status": 410}})
