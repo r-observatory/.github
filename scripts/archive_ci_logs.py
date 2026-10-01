@@ -431,3 +431,123 @@ def summary(month, rows):
     mb = sum(int(r["zip_bytes"] or 0) for r in rows) / 1e6
     return (f"{month}: {runs} runs, {len(rows)} attempts: {n['ok']} ok, {n['gone']} gone, "
             f"{n['error']} error, {mb:.1f} MB")
+
+
+# --- the release ------------------------------------------------------------
+
+def release_state(repo, budget):
+    """{'id', 'assets': {name: state}} for the ci-logs release, or None on a 404."""
+    try:
+        rel = with_retries(lambda: gh_json(["api", f"repos/{repo}/releases/tags/{TAG}"]), budget)
+    except GhError as e:
+        if e.status == 404:
+            return None
+        raise
+    assets, page = {}, 1
+    while True:
+        batch = with_retries(lambda: gh_json(
+            ["api", f"repos/{repo}/releases/{rel['id']}/assets?per_page=100&page={page}"]), budget)
+        assets.update({a["name"]: a.get("state", "uploaded") for a in batch})
+        if len(batch) < 100:
+            return {"id": rel["id"], "assets": assets}
+        page += 1
+
+
+def ensure_release(repo, budget):
+    """The release state, creating the release only when the lookup answered 404."""
+    state = release_state(repo, budget)
+    if state is not None:
+        return state
+    print(f"creating release {TAG} in {repo}", flush=True)
+    budget.spend()
+    try:
+        gh(["release", "create", TAG, "--repo", repo, "--prerelease", "--latest=false",
+            "--title", "CI logs", "--notes", RELEASE_NOTES])
+    except GhError as e:
+        # Another run may have created it first; the lookup below decides.
+        print(f"create failed ({e.text.strip()[:120]}); looking the release up again", flush=True)
+    state = release_state(repo, budget)
+    if state is None:
+        raise RuntimeError(f"release {TAG} does not exist after the attempt to create it")
+    return state
+
+
+def month_status(assets, month):
+    names = pair_names(month)
+    if any(n in assets and assets[n] != "uploaded" for n in names):
+        return "stuck"
+    has_tar, has_tsv = (n in assets for n in names)
+    if has_tar and has_tsv:
+        return "archived"
+    return "lone_tar" if has_tar else "lone_tsv" if has_tsv else "absent"
+
+
+def upload_asset(repo, path, budget):
+    name = os.path.basename(path)
+    for n in range(1, TRIES + 1):
+        budget.spend()
+        try:
+            gh(["release", "upload", TAG, path, "--repo", repo])
+            return
+        except GhError as e:
+            state = release_state(repo, budget)
+            if state and state["assets"].get(name) == "uploaded":
+                return
+            if n == TRIES:
+                raise
+            print(f"upload of {name} failed ({e.text.strip()[:120]}); retrying", flush=True)
+            sleep(BACKOFF_S[n - 1])
+
+
+def repair_tsv(repo, month, work_dir, budget):
+    """Upload the index a lone tar carries, after an upload that stopped between the files."""
+    tar_name, tsv_name = pair_names(month)
+    base = os.path.join(work_dir, month, "repair")
+    os.makedirs(base, exist_ok=True)
+    with_retries(lambda: gh(["release", "download", TAG, "--repo", repo, "--pattern", tar_name,
+                             "--dir", base, "--clobber"]), budget)
+    tar_path, tsv_path = os.path.join(base, tar_name), os.path.join(base, tsv_name)
+    with tarfile.open(tar_path) as tar:
+        index = tar.extractfile("index.tsv").read()
+    with open(tsv_path, "wb") as f:
+        f.write(index)
+    verify_pair(tar_path, tsv_path)
+    upload_asset(repo, tsv_path, budget)
+
+
+def publish_month(repo, month, tar_path, tsv_path, now, budget):
+    """'uploaded', 'uploaded_with_errors', 'held', or 'archived' when another upload won."""
+    rows = verify_pair(tar_path, tsv_path)
+    errors = sum(r["outcome"] == "error" for r in rows)
+    if errors and not upload_anyway(month, now):
+        print(f"::error::{month}: {errors} attempts failed to download; the month waits until "
+              f"they do or until day {UPLOAD_ANYWAY_DAY}", flush=True)
+        return "held"
+    if month_status(release_state(repo, budget)["assets"], month) != "absent":
+        print(f"{month}: archived by another upload meanwhile; this pair is not uploaded", flush=True)
+        return "archived"
+    upload_asset(repo, tar_path, budget)
+    upload_asset(repo, tsv_path, budget)
+    print(f"{month}: uploaded {os.path.basename(tar_path)} and {os.path.basename(tsv_path)}", flush=True)
+    if errors:
+        print(f"::error::{month}: uploaded with {errors} attempts recorded as error", flush=True)
+        return "uploaded_with_errors"
+    return "uploaded"
+
+
+def settle_month(repo, month, work_dir, budget, now, produce):
+    """Bring one month to archived; False when it needs another run or a hand."""
+    status = month_status(release_state(repo, budget)["assets"], month)
+    if status == "archived":
+        print(f"{month}: already archived", flush=True)
+        return True
+    if status == "lone_tar":
+        repair_tsv(repo, month, work_dir, budget)
+        print(f"{month}: uploaded the index its tar carries", flush=True)
+        return True
+    if status != "absent":
+        print(f"::error::{month}: the release holds an incomplete pair ({status}); "
+              "check the assets by hand", flush=True)
+        return False
+    tar_path, tsv_path = produce(month)
+    return publish_month(repo, month, tar_path, tsv_path, now, budget) in ("uploaded", "archived")
