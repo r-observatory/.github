@@ -11,7 +11,8 @@ repositories); release (the ci-logs release: null, or {"id", "assets": [{"name",
 "state"}]}); releases ({tag: the same}, for every other tag); release_status (the
 HTTP status every tag lookup answers with); create_status (the status a create
 fails with) and create_race (the release exists all the same); rate ({"limit",
-"remaining", "reset"}, spent by every api call); rate_error ({"status", "skip",
+"remaining", "reset"}, spent by every api call); rates ({token: the same}, the
+rate limit of that token in place of rate); rate_error ({"status", "skip",
 "times"}: after `skip` good reads the rate_limit call fails, `times` times or
 always); fail_uploads (asset names whose upload fails); store (directory
 holding uploaded files, those of another tag in a folder named after it);
@@ -102,6 +103,10 @@ def store_dir(state, tag):
     return path
 
 
+def rate_of(state):
+    return state.get("rates", {}).get(TOKEN) or state.get("rate")
+
+
 def writes_only(state):
     """Releases and the workflow enable answer only the write token."""
     auth = state.get("auth")
@@ -132,14 +137,14 @@ def api(state, args):
             if "times" in err:
                 err["times"] -= 1
             fail(state, err["status"], err.get("message", "Server Error"))
-        core = state.get("rate") or {"limit": 5000, "remaining": 5000, "reset": 0}
+        core = rate_of(state) or {"limit": 5000, "remaining": 5000, "reset": 0}
         if include:
             sys.stdout.write("HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n")
             if auth.get("expires") and TOKEN == auth.get("read"):
                 sys.stdout.write(f"Github-Authentication-Token-Expiration: {auth['expires']}\r\n")
             sys.stdout.write("X-Ratelimit-Limit: 5000\r\n\r\n")
         reply(state, {"resources": {"core": core}})
-    rate = state.get("rate")
+    rate = rate_of(state)
     if rate:
         if rate["remaining"] <= 0:
             fail(state, 403, "API rate limit exceeded for installation ID 1")

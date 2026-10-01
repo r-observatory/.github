@@ -188,7 +188,43 @@ class TwoTokens(Harness):
         self.assertEqual(self.main("keepalive", "--repo", REPO, "--workflow-ref", ref), 0)
 
         self.assertEqual(self.state()["enabled"], ["archive-ci-logs.yml"])
-        self.assertEqual(self.tokens_of("/enable"), {WRITE})
+        self.assertEqual(set(self.state()["tokens"]), {WRITE})
+
+    def test_the_workflow_is_re_enabled_when_the_read_token_is_expired_or_revoked(self):
+        self.two_tokens(dead=[READ])
+        ref = f"{REPO}/.github/workflows/archive-ci-logs.yml@refs/heads/main"
+
+        code, errors, lines = self.run_main("keepalive", "--repo", REPO, "--workflow-ref", ref)
+
+        self.assertEqual((code, errors), (0, []))
+        self.assertEqual(lines, ["re-enabled archive-ci-logs.yml"])
+        self.assertEqual(self.state()["enabled"], ["archive-ci-logs.yml"])
+        self.assertEqual(set(self.state()["tokens"]), {WRITE})
+        self.assertEqual(self.slept, [])
+
+    def test_a_spent_read_token_budget_does_not_hold_up_the_re_enable(self):
+        self.two_tokens()
+        self.put(rates={READ: {"limit": 5000, "remaining": 10,
+                               "reset": int(self.now.timestamp()) + 1800}})
+        ref = f"{REPO}/.github/workflows/archive-ci-logs.yml@refs/heads/main"
+
+        self.assertEqual(self.main("keepalive", "--repo", REPO, "--workflow-ref", ref), 0)
+
+        self.assertEqual(self.state()["enabled"], ["archive-ci-logs.yml"])
+        self.assertEqual(set(self.state()["tokens"]), {WRITE})
+        self.assertEqual(self.slept, [])
+
+    def test_the_re_enable_waits_on_the_budget_of_the_ambient_token(self):
+        self.two_tokens()
+        reset = int(self.now.timestamp()) + 1800
+        self.put(rates={WRITE: {"limit": 1000, "remaining": 10, "reset": reset}})
+        ref = f"{REPO}/.github/workflows/archive-ci-logs.yml@refs/heads/main"
+
+        self.assertEqual(self.main("keepalive", "--repo", REPO, "--workflow-ref", ref), 0)
+
+        self.assertEqual(self.state()["enabled"], ["archive-ci-logs.yml"])
+        self.assertEqual(set(self.state()["tokens"]), {WRITE})
+        self.assertEqual(self.slept, [1805])
 
     def test_without_a_read_token_every_call_uses_the_ambient_login(self):
         self.put(runs=[run(1, "2026-08-02T06:00:00Z")])

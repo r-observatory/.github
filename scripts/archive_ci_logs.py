@@ -16,7 +16,8 @@ that holds the release has to be private.
   keepalive    re-enable the calling workflow so its schedule never lapses
 
 When CI_LOGS_READ_TOKEN is set, runs, logs and the rate limit are read with it.
-Releases and the keepalive always use the ambient gh credentials.
+Releases and every call of keepalive, its rate limit read included, always use
+the ambient gh credentials.
 """
 import argparse
 import csv
@@ -200,17 +201,20 @@ class BudgetUnreadable(Exception):
 
 
 class Budget:
-    """Leaves a reserve of the hourly API budget of the token that reads runs and logs."""
+    """Leaves a reserve of the hourly API budget of the token that reads runs and logs.
 
-    def __init__(self, floor=BUDGET_FLOOR, every=BUDGET_EVERY):
-        self.floor, self.every, self.calls = floor, every, 0
+    With source=False the budget is that of the ambient credentials.
+    """
+
+    def __init__(self, floor=BUDGET_FLOOR, every=BUDGET_EVERY, source=True):
+        self.floor, self.every, self.source, self.calls = floor, every, source, 0
 
     def core(self):
         """The core rate limit, read up to TRIES times."""
         args = ["api", "rate_limit"]
         for n in range(1, TRIES + 1):
             try:
-                core = gh_json(args, source=True)["resources"]["core"]
+                core = gh_json(args, source=self.source)["resources"]["core"]
                 return {k: int(core[k]) for k in ("limit", "remaining", "reset")}
             except GhError as e:
                 if is_refusal(e):
@@ -961,14 +965,17 @@ def cmd_check_token(a):
 
 
 def cmd_keepalive(a):
-    """Re-enabling a workflow restarts GitHub's 60-day inactivity clock for it."""
+    """Re-enabling a workflow restarts GitHub's 60-day inactivity clock for it.
+
+    No call carries the read token, so the schedule outlives a read token that is refused.
+    """
     path = a.workflow_ref.split("@", 1)[0]
     prefix = f"{a.repo}/.github/workflows/"
     name = path[len(prefix):] if path.startswith(prefix) else ""
     if not re.fullmatch(r"[A-Za-z0-9._-]+\.ya?ml", name):
         raise UsageError(f"{a.workflow_ref!r} is not a workflow of {a.repo}")
     with_retries(lambda: gh(["api", "-X", "PUT", f"repos/{a.repo}/actions/workflows/{name}/enable"]),
-                 Budget())
+                 Budget(source=False))
     print(f"re-enabled {name}", flush=True)
     return 0
 
