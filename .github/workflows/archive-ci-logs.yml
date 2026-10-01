@@ -1,0 +1,52 @@
+name: Archive CI logs
+
+# Called from each repository's own archive-ci-logs.yml. Keeps that repository's
+# Actions logs past GitHub's 90-day retention, one pair of assets per closed
+# month on its ci-logs prerelease, using the repository's own token.
+on:
+  workflow_call:
+    inputs:
+      month:
+        description: Closed month still inside retention (YYYY-MM); empty archives every month that is due
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      actions: write
+      contents: write
+    concurrency:
+      group: archive-ci-logs
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out the archiver
+        uses: actions/checkout@v7
+        with:
+          repository: r-observatory/.github
+          ref: main
+          path: .archive-ci-logs
+          persist-credentials: false
+
+      - name: Archive closed months
+        env:
+          MONTH: ${{ inputs.month }}
+        run: |
+          set -euo pipefail
+          args=(archive --repo "$GH_REPO" --work-dir "$RUNNER_TEMP/ci-logs")
+          if [ -n "$MONTH" ]; then args+=(--month "$MONTH"); fi
+          python3 .archive-ci-logs/scripts/archive_ci_logs.py "${args[@]}"
+
+      # Runs even when archiving failed: a broken pipeline stops pushing, and
+      # GitHub would otherwise disable this schedule after 60 quiet days.
+      - name: Keep this schedule enabled
+        if: always()
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: python3 .archive-ci-logs/scripts/archive_ci_logs.py keepalive --repo "$GH_REPO" --workflow-ref "$WORKFLOW_REF"
