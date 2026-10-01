@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Keep a repository's GitHub Actions logs past GitHub's 90-day retention.
+"""Keep GitHub Actions logs past GitHub's 90-day retention.
 
-Each closed month becomes two assets on the repository's ci-logs prerelease:
+Each closed month of a repository becomes two assets on a prerelease:
 ci-logs-YYYY-MM.tar (index.tsv plus one log zip per run attempt) and
 ci-logs-YYYY-MM.tsv (the same index). Assets are added once and never replaced.
+The release is ci-logs in the repository itself, unless --release-repo names
+another repository, where --tag has to name the release as well. The repository
+that holds the release has to be private.
 
-  archive    list, fetch and upload every month that is due (the workflow)
-  build      fetch months into a work directory without touching the release
-  upload     upload months that build left in a work directory
-  keepalive  re-enable the calling workflow so its schedule never lapses
+  sweep        archive every repository listed in a file into one repository
+  archive      list, fetch and upload every month of one repository that is due
+  build        fetch months into a work directory without touching the release
+  upload       upload months that build left in a work directory
+  check-token  fail when the read token is missing, refused or close to expiry
+  keepalive    re-enable the calling workflow so its schedule never lapses
+
+When CI_LOGS_READ_TOKEN is set, runs, logs and the rate limit are read with it.
+Releases and every call of keepalive, its rate limit read included, always use
+the ambient gh credentials.
 """
 import argparse
 import csv
@@ -35,11 +44,16 @@ TRIES = 3
 BACKOFF_S = (10, 30)
 BUDGET_FLOOR = 300
 BUDGET_EVERY = 25
+READ_TOKEN = "CI_LOGS_READ_TOKEN"
+EXPIRY_HEADER = "github-authentication-token-expiration"
+ACCESS_CHECK_DAYS = 85
+ACCESS_PROBES = 3
+ACCESS_PAGE = 30
 COLUMNS = ["run_id", "run_attempt", "workflow_name", "workflow_path", "event",
            "conclusion", "head_branch", "head_sha", "created_at",
            "run_started_at", "updated_at", "zip_bytes", "zip_sha256", "outcome"]
 RELEASE_NOTES = (
-    "GitHub Actions logs of this repository, kept past GitHub's 90-day retention. "
+    "GitHub Actions logs of {source}, kept past GitHub's 90-day retention. "
     "Each closed month has two files: ci-logs-YYYY-MM.tar holds index.tsv and one log "
     "zip per run attempt, and ci-logs-YYYY-MM.tsv is the same index. The index gives "
     "each attempt's workflow, event, conclusion, commit, times, zip size and sha256, "
@@ -48,6 +62,9 @@ RELEASE_NOTES = (
     "prerelease so that it never becomes the repository's latest release.")
 LOCAL_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}_(\d+)_.*\.zip$")
 MEMBER_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}_(\d+)_a(\d+)_.*\.zip$")
+REPO_NAME = re.compile(r"[A-Za-z0-9._-]+")
+TAG_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+EXPIRY = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (UTC|[+-]\d{4})")
 
 
 class UsageError(Exception):
@@ -102,6 +119,17 @@ def check_months(months, now):
     return sorted(set(months))
 
 
+def months_to_archive(requested, now):
+    """The requested months, or every month that is due; none may be past retention."""
+    months = check_months(requested, now) if requested else months_due(now)
+    late = sorted(set(months) - set(months_due(now)))
+    if late:
+        # A month whose first days are already gone is built from a local copy instead.
+        raise UsageError(f"{', '.join(late)}: its earliest logs are past retention; "
+                         "use build with a local copy, then upload")
+    return months
+
+
 def upload_anyway(month, now):
     return now >= month_bounds(month)[0] + dt.timedelta(days=UPLOAD_ANYWAY_DAY)
 
@@ -130,21 +158,42 @@ def http_status(text):
     return int(m.group(1)) if m else None
 
 
-def gh(args, out=None):
-    """Run gh and return its stdout, or write stdout to the path `out`."""
+class Refused(Exception):
+    """GitHub turned the credentials away, or access to a repository's logs was not shown.
+
+    Nothing is retried and no row is written: the repository stops with nothing
+    built or uploaded.
+    """
+
+
+def is_refusal(e):
+    """A 401, or a 403 that is not a rate limit: waiting does not change the answer."""
+    return e.status == 401 or (e.status == 403 and "rate limit" not in e.text.lower())
+
+
+def read_token():
+    return os.environ.get(READ_TOKEN, "").strip()
+
+
+def gh(args, out=None, source=False):
+    """Run gh and return its stdout, or write stdout to the path `out`.
+
+    A source call reads runs, logs or the rate limit, with the read token when one is set.
+    """
+    env = dict(os.environ, GH_TOKEN=read_token()) if source and read_token() else None
     if out is None:
-        p = subprocess.run(["gh"] + args, capture_output=True)
+        p = subprocess.run(["gh"] + args, capture_output=True, env=env)
     else:
         with open(out, "wb") as f:
-            p = subprocess.run(["gh"] + args, stdout=f, stderr=subprocess.PIPE)
+            p = subprocess.run(["gh"] + args, stdout=f, stderr=subprocess.PIPE, env=env)
     if p.returncode != 0:
         text = p.stderr.decode("utf-8", "replace")
         raise GhError(args, http_status(text), text)
     return p.stdout or b""
 
 
-def gh_json(args):
-    return json.loads(gh(args) or b"null")
+def gh_json(args, source=False):
+    return json.loads(gh(args, source=source) or b"null")
 
 
 class BudgetUnreadable(Exception):
@@ -152,19 +201,24 @@ class BudgetUnreadable(Exception):
 
 
 class Budget:
-    """Leaves a reserve of the hourly API budget to the repository's own workflows."""
+    """Leaves a reserve of the hourly API budget of the token that reads runs and logs.
 
-    def __init__(self, floor=BUDGET_FLOOR, every=BUDGET_EVERY):
-        self.floor, self.every, self.calls = floor, every, 0
+    With source=False the budget is that of the ambient credentials.
+    """
+
+    def __init__(self, floor=BUDGET_FLOOR, every=BUDGET_EVERY, source=True):
+        self.floor, self.every, self.source, self.calls = floor, every, source, 0
 
     def core(self):
         """The core rate limit, read up to TRIES times."""
         args = ["api", "rate_limit"]
         for n in range(1, TRIES + 1):
             try:
-                core = gh_json(args)["resources"]["core"]
+                core = gh_json(args, source=self.source)["resources"]["core"]
                 return {k: int(core[k]) for k in ("limit", "remaining", "reset")}
             except GhError as e:
+                if is_refusal(e):
+                    raise Refused(f"refused, not retried: {e}") from e
                 why = str(e)
             except (KeyError, TypeError, ValueError):
                 why = f"gh {' '.join(args)}: the reply did not give the core limit"
@@ -197,12 +251,14 @@ class Budget:
 
 
 def with_retries(fn, budget):
-    """fn() through transient failures; 404 and 410 are raised at once."""
+    """fn() through transient failures; 404 and 410 are raised at once, a refusal as Refused."""
     for n in range(1, TRIES + 1):
         budget.spend()
         try:
             return fn()
         except GhError as e:
+            if is_refusal(e):
+                raise Refused(f"refused, not retried: {e}") from e
             if e.status in (404, 410) or n == TRIES:
                 raise
             if e.status == 429 or "rate limit" in e.text.lower():
@@ -218,7 +274,7 @@ def list_slice(repo, a, b, budget):
          f"&per_page=100&created={a.isoformat()}T00:00:00Z..{b.isoformat()}T23:59:59Z")
     got, total, page = [], 0, 1
     while True:
-        body = with_retries(lambda: gh_json(["api", f"{q}&page={page}"]), budget)
+        body = with_retries(lambda: gh_json(["api", f"{q}&page={page}"], source=True), budget)
         if page == 1:
             total = body.get("total_count", 0)
         batch = body.get("workflow_runs", [])
@@ -264,7 +320,8 @@ def attempt_meta(repo, run, n, budget):
         return run
     try:
         return with_retries(
-            lambda: gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/attempts/{n}"]), budget)
+            lambda: gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/attempts/{n}"], source=True),
+            budget)
     except GhError:
         return dict(run, conclusion=None, run_started_at=None, updated_at=None)
 
@@ -291,7 +348,7 @@ def fetch_log(repo, run_id, n, dest, budget):
 
     def once():
         try:
-            gh(args, out=dest)
+            gh(args, out=dest, source=True)
         except GhError:
             remove(dest)
             raise
@@ -307,6 +364,50 @@ def fetch_log(repo, run_id, n, dest, budget):
             return "gone"
         print(f"::warning::run {run_id} attempt {n}: {e.text.strip()[:200]}", flush=True)
         return "error"
+
+
+def newest_completed(repo, budget, floor):
+    """The first ACCESS_PROBES completed runs created after `floor`, newest first.
+
+    The listing is not filtered by status, because GitHub has answered that
+    filter with a part of the runs. The last page read is the first that is not
+    full or holds a run from before `floor`.
+    """
+    found, page = [], 1
+    while True:
+        q = f"repos/{repo}/actions/runs?per_page={ACCESS_PAGE}&page={page}"
+        runs = with_retries(lambda: gh_json(["api", q], source=True), budget).get("workflow_runs", [])
+        recent = [r for r in runs if parse_time(r["created_at"]) > floor]
+        found += [r for r in recent if r.get("status") == "completed"]
+        if len(found) >= ACCESS_PROBES or len(recent) < ACCESS_PAGE:
+            return found[:ACCESS_PROBES]
+        page += 1
+
+
+def check_access(repo, work_dir, budget, now):
+    """Download one recent log, to show the credentials can read this repository's logs.
+
+    Without access GitHub may answer 404, which fetch_log records as gone. A
+    repository with no completed run newer than ACCESS_CHECK_DAYS has nothing
+    to show and passes.
+    """
+    try:
+        recent = newest_completed(repo, budget, now - dt.timedelta(days=ACCESS_CHECK_DAYS))
+    except GhError as e:
+        raise Refused(f"{repo}: its runs could not be listed, so nothing is built or uploaded "
+                      f"for it ({e})") from e
+    if not recent:
+        return
+    os.makedirs(work_dir, exist_ok=True)
+    dest, seen = os.path.join(work_dir, "access-check.zip"), []
+    for run in recent:
+        outcome = fetch_log(repo, run["id"], run["run_attempt"], dest, budget)
+        remove(dest)
+        if outcome == "ok":
+            return
+        seen.append(f"run {run['id']} {outcome}")
+    raise Refused(f"{repo}: no log of its newest runs could be downloaded ({', '.join(seen)}), "
+                  "so access to its logs is not shown and nothing is built or uploaded for it")
 
 
 def cache_index(cache_dir):
@@ -450,6 +551,11 @@ def verify_pair(tar_path, tsv_path):
     return rows
 
 
+def label(tag, month):
+    """How a month is named in the output: with its tag when that is not the default."""
+    return month if tag == TAG else f"{tag} {month}"
+
+
 def summary(month, rows):
     n = {k: sum(r["outcome"] == k for r in rows) for k in ("ok", "gone", "error")}
     runs = len({r["run_id"] for r in rows})
@@ -460,10 +566,26 @@ def summary(month, rows):
 
 # --- the release ------------------------------------------------------------
 
-def release_state(repo, budget):
-    """{'id', 'assets': {name: state}} for the ci-logs release, or None on a 404."""
+def check_tag(tag):
+    if not TAG_NAME.fullmatch(tag or "") or ".." in tag or tag.endswith((".", ".lock")):
+        raise UsageError(f"{tag!r} is not a usable release tag")
+    return tag
+
+
+def check_private(repo, budget, command):
+    """Stop unless the repository that is to hold the logs is private."""
     try:
-        rel = with_retries(lambda: gh_json(["api", f"repos/{repo}/releases/tags/{TAG}"]), budget)
+        seen = with_retries(lambda: gh_json(["api", f"repos/{repo}"]), budget)
+    except GhError as e:
+        raise RuntimeError(f"{repo} could not be looked up, so it is not known to be private ({e})") from e
+    if seen.get("private") is not True:
+        raise UsageError(f"{repo} is not private; {command} writes logs only to a private repository")
+
+
+def release_state(repo, budget, tag=TAG):
+    """{'id', 'assets': {name: state}} for the release with this tag, or None on a 404."""
+    try:
+        rel = with_retries(lambda: gh_json(["api", f"repos/{repo}/releases/tags/{tag}"]), budget)
     except GhError as e:
         if e.status == 404:
             return None
@@ -478,30 +600,36 @@ def release_state(repo, budget):
         page += 1
 
 
-def ensure_release(repo, budget):
-    """The release state, creating the release only when the lookup answered 404."""
-    state = release_state(repo, budget)
+def ensure_release(repo, budget, tag=TAG, source=None):
+    """The release state, creating the release only when the lookup answered 404.
+
+    The title and notes name `source` when the release holds another repository's logs.
+    """
+    state = release_state(repo, budget, tag)
     if state is not None:
         return state
-    print(f"creating release {TAG} in {repo}", flush=True)
+    other = source not in (None, repo)
+    title = f"CI logs of {source}" if other else "CI logs"
+    notes = RELEASE_NOTES.format(source=source if other else "this repository")
+    print(f"creating release {tag} in {repo}", flush=True)
     budget.spend()
     try:
-        gh(["release", "create", TAG, "--repo", repo, "--prerelease", "--latest=false",
-            "--title", "CI logs", "--notes", RELEASE_NOTES])
+        gh(["release", "create", tag, "--repo", repo, "--prerelease", "--latest=false",
+            "--title", title, "--notes", notes])
     except GhError as e:
         # Another run may have created it first; the lookup below decides.
         print(f"create failed ({e.text.strip()[:120]}); looking the release up again", flush=True)
-    state = release_state(repo, budget)
+    state = release_state(repo, budget, tag)
     if state is None:
-        raise RuntimeError(f"release {TAG} does not exist after the attempt to create it")
+        raise RuntimeError(f"release {tag} does not exist after the attempt to create it")
     return state
 
 
-def release_assets(repo, budget):
+def release_assets(repo, budget, tag=TAG):
     """The assets of the release the run found or created when it began."""
-    state = release_state(repo, budget)
+    state = release_state(repo, budget, tag)
     if state is None:
-        raise RuntimeError(f"release {TAG} was not found; it was there when the run began")
+        raise RuntimeError(f"release {tag} was not found; it was there when the run began")
     return state["assets"]
 
 
@@ -515,15 +643,15 @@ def month_status(assets, month):
     return "lone_tar" if has_tar else "lone_tsv" if has_tsv else "absent"
 
 
-def upload_asset(repo, path, budget):
+def upload_asset(repo, path, budget, tag=TAG):
     name = os.path.basename(path)
     for n in range(1, TRIES + 1):
         budget.spend()
         try:
-            gh(["release", "upload", TAG, path, "--repo", repo])
+            gh(["release", "upload", tag, path, "--repo", repo])
             return
         except GhError as e:
-            state = release_state(repo, budget)
+            state = release_state(repo, budget, tag)
             if state and state["assets"].get(name) == "uploaded":
                 return
             if n == TRIES:
@@ -532,12 +660,12 @@ def upload_asset(repo, path, budget):
             sleep(BACKOFF_S[n - 1])
 
 
-def repair_tsv(repo, month, work_dir, budget):
+def repair_tsv(repo, month, work_dir, budget, tag=TAG):
     """Upload the index a lone tar carries, after an upload that stopped between the files."""
     tar_name, tsv_name = pair_names(month)
     base = os.path.join(work_dir, month, "repair")
     os.makedirs(base, exist_ok=True)
-    with_retries(lambda: gh(["release", "download", TAG, "--repo", repo, "--pattern", tar_name,
+    with_retries(lambda: gh(["release", "download", tag, "--repo", repo, "--pattern", tar_name,
                              "--dir", base, "--clobber"]), budget)
     tar_path, tsv_path = os.path.join(base, tar_name), os.path.join(base, tsv_name)
     with tarfile.open(tar_path) as tar:
@@ -547,73 +675,178 @@ def repair_tsv(repo, month, work_dir, budget):
     with open(tsv_path, "wb") as f:
         f.write(index)
     verify_pair(tar_path, tsv_path)
-    upload_asset(repo, tsv_path, budget)
+    upload_asset(repo, tsv_path, budget, tag)
 
 
-def publish_month(repo, month, tar_path, tsv_path, now, budget):
+def publish_month(repo, month, tar_path, tsv_path, now, budget, tag=TAG):
     """'uploaded', 'uploaded_with_errors', 'held', or 'archived' when another upload won."""
+    name = label(tag, month)
     rows = verify_pair(tar_path, tsv_path)
     errors = sum(r["outcome"] == "error" for r in rows)
     if errors and not upload_anyway(month, now):
-        print(f"::error::{month}: {errors} attempts failed to download; the month waits until "
+        print(f"::error::{name}: {errors} attempts failed to download; the month waits until "
               f"they do or until day {UPLOAD_ANYWAY_DAY}", flush=True)
         return "held"
-    if month_status(release_assets(repo, budget), month) != "absent":
-        print(f"{month}: archived by another upload meanwhile; this pair is not uploaded", flush=True)
+    if month_status(release_assets(repo, budget, tag), month) != "absent":
+        print(f"{name}: archived by another upload meanwhile; this pair is not uploaded", flush=True)
         return "archived"
-    upload_asset(repo, tar_path, budget)
-    upload_asset(repo, tsv_path, budget)
-    print(f"{month}: uploaded {os.path.basename(tar_path)} and {os.path.basename(tsv_path)}", flush=True)
+    upload_asset(repo, tar_path, budget, tag)
+    upload_asset(repo, tsv_path, budget, tag)
+    print(f"{name}: uploaded {os.path.basename(tar_path)} and {os.path.basename(tsv_path)}", flush=True)
     if errors:
-        print(f"::error::{month}: uploaded with {errors} attempts recorded as error", flush=True)
+        print(f"::error::{name}: uploaded with {errors} attempts recorded as error", flush=True)
         return "uploaded_with_errors"
     return "uploaded"
 
 
-def settle_month(repo, month, work_dir, budget, now, produce):
+def settle_month(repo, month, work_dir, budget, now, produce, tag=TAG):
     """Bring one month to archived; False when it needs another run or a hand."""
-    status = month_status(release_assets(repo, budget), month)
+    name = label(tag, month)
+    status = month_status(release_assets(repo, budget, tag), month)
     if status == "archived":
-        print(f"{month}: already archived", flush=True)
+        print(f"{name}: already archived", flush=True)
         return True
     if status == "lone_tar":
-        repair_tsv(repo, month, work_dir, budget)
-        print(f"{month}: uploaded the index its tar carries", flush=True)
+        repair_tsv(repo, month, work_dir, budget, tag)
+        print(f"{name}: uploaded the index its tar carries", flush=True)
         return True
     if status != "absent":
-        print(f"::error::{month}: the release holds an incomplete pair ({status}); "
+        print(f"::error::{name}: the release holds an incomplete pair ({status}); "
               "check the assets by hand", flush=True)
         return False
     tar_path, tsv_path = produce(month)
-    return publish_month(repo, month, tar_path, tsv_path, now, budget) in ("uploaded", "archived")
+    return publish_month(repo, month, tar_path, tsv_path, now, budget, tag) in ("uploaded", "archived")
+
+
+def settle_months(repo, months, work_dir, budget, now, produce, tag):
+    """Settle each month in turn; one month's failure does not stop the next."""
+    ok = True
+    for month in months:
+        try:
+            ok &= settle_month(repo, month, work_dir, budget, now, produce, tag)
+        except (GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+            print(f"::error::{label(tag, month)}: {e}", flush=True)
+            ok = False
+    return ok
+
+
+def archive_repo(source, release_repo, tag, months, work_dir, budget, now):
+    """Bring the months of one repository to archived; False when one needs another run."""
+    shown = False
+
+    def show_access():
+        nonlocal shown
+        if not shown:
+            check_access(source, work_dir, budget, now)
+            shown = True
+
+    def produce(month):
+        show_access()
+        rows = collect_month(source, month, work_dir, budget)
+        print(summary(label(tag, month), rows), flush=True)
+        return write_pair(month, rows, work_dir)
+
+    if release_state(release_repo, budget, tag) is None:
+        if months:
+            # Every month has to be built, so access is shown before a release is created.
+            show_access()
+        ensure_release(release_repo, budget, tag, source)
+    return settle_months(release_repo, months, work_dir, budget, now, produce, tag)
+
+
+# --- the list of repositories -----------------------------------------------
+
+def read_repos_file(path):
+    """(listed, left_out): the names to archive, and the names after `!` left out on purpose."""
+    listed, left_out = [], []
+    with open(path) as f:
+        for line in f:
+            text = line.split("#", 1)[0].strip()
+            if not text:
+                continue
+            name = text.lstrip("!")
+            if not REPO_NAME.fullmatch(name) or len(text) - len(name) > 1:
+                raise UsageError(f"{path}: {text!r} is not a repository name")
+            if name in listed or name in left_out:
+                raise UsageError(f"{path}: {name} is in the file more than once")
+            if text.startswith("!"):
+                left_out.append(name)
+                continue
+            try:
+                check_tag(name)
+            except UsageError:
+                raise UsageError(f"{path}: {name!r} cannot be a release tag; "
+                                 f"leave it out with !{name}") from None
+            listed.append(name)
+    if not listed:
+        raise UsageError(f"{path} lists no repository")
+    return listed, left_out
+
+
+def unlisted_repos(owner, known, budget):
+    """The owner's public, unarchived repositories that have a run and are not in `known`."""
+    out, page = [], 1
+    while True:
+        batch = with_retries(lambda: gh_json(
+            ["api", f"users/{owner}/repos?per_page=100&page={page}"], source=True), budget)
+        for r in batch:
+            if r.get("private") or r.get("archived") or r["name"] in known:
+                continue
+            runs = with_retries(lambda: gh_json(
+                ["api", f"repos/{owner}/{r['name']}/actions/runs?per_page=1"], source=True), budget)
+            if runs.get("total_count", 0) > 0:
+                out.append(r["name"])
+        if len(batch) < 100:
+            return sorted(out)
+        page += 1
+
+
+# --- the read token ---------------------------------------------------------
+
+def token_missing():
+    print(f"::error::the read token {READ_TOKEN} is missing: the secret is empty or not set", flush=True)
+    return 1
+
+
+def response_headers(text):
+    """The headers of a `gh api -i` reply, names in lower case."""
+    out = {}
+    for line in text.splitlines()[1:]:
+        if not line.strip():
+            break
+        name, _, value = line.partition(":")
+        out[name.strip().lower()] = value.strip()
+    return out
+
+
+def parse_expiry(value):
+    m = EXPIRY.fullmatch(value)
+    if not m:
+        raise ValueError(f"the expiry date of the read token could not be read: {value!r}")
+    zone = "+0000" if m.group(2) == "UTC" else m.group(2)
+    return dt.datetime.strptime(f"{m.group(1)} {zone}", "%Y-%m-%d %H:%M:%S %z")
 
 
 # --- commands ---------------------------------------------------------------
 
+def destination(a):
+    """(release repository, tag); in another repository each source has its own release."""
+    release_repo = a.release_repo or a.repo
+    if a.tag is None and release_repo != a.repo:
+        name = a.repo.rsplit("/", 1)[-1]
+        raise UsageError(f"--release-repo {release_repo} is not --repo {a.repo}, so --tag is needed: "
+                         f"without one every source would share the release {TAG} there. sweep names "
+                         f"the release after the repository (--tag {name})")
+    return release_repo, check_tag(TAG if a.tag is None else a.tag)
+
+
 def cmd_archive(a):
     now = utcnow()
-    months = check_months(a.month, now) if a.month else months_due(now)
-    late = sorted(set(months) - set(months_due(now)))
-    if late:
-        # A month whose first days are already gone is built from a local copy instead.
-        raise UsageError(f"{', '.join(late)}: its earliest logs are past retention; "
-                         "use build with a local copy, then upload")
+    release_repo, tag = destination(a)
+    months = months_to_archive(a.month, now)
     budget = Budget()
-    ensure_release(a.repo, budget)
-
-    def produce(month):
-        rows = collect_month(a.repo, month, a.work_dir, budget)
-        print(summary(month, rows), flush=True)
-        return write_pair(month, rows, a.work_dir)
-
-    ok = True
-    for month in months:
-        try:
-            ok &= settle_month(a.repo, month, a.work_dir, budget, now, produce)
-        except (GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
-            print(f"::error::{month}: {e}", flush=True)
-            ok = False
-    return 0 if ok else 1
+    check_private(release_repo, budget, a.command)
+    return 0 if archive_repo(a.repo, release_repo, tag, months, a.work_dir, budget, now) else 1
 
 
 def cmd_build(a):
@@ -622,6 +855,7 @@ def cmd_build(a):
     if not months:
         raise UsageError("build needs at least one --month")
     budget, cache, errors = Budget(), cache_index(a.cache_dir), 0
+    check_access(a.repo, a.work_dir, budget, now)
     for month in months:
         rows = collect_month(a.repo, month, a.work_dir, budget, cache)
         verify_pair(*write_pair(month, rows, a.work_dir))
@@ -632,11 +866,13 @@ def cmd_build(a):
 
 def cmd_upload(a):
     now = utcnow()
+    release_repo, tag = destination(a)
     months = check_months(a.month, now)
     if not months:
         raise UsageError("upload needs at least one --month")
     budget = Budget()
-    ensure_release(a.repo, budget)
+    check_private(release_repo, budget, a.command)
+    ensure_release(release_repo, budget, tag, a.repo)
 
     def produce(month):
         paths = [os.path.join(a.work_dir, month, n) for n in pair_names(month)]
@@ -644,25 +880,102 @@ def cmd_upload(a):
             raise RuntimeError(f"no built pair for {month} in {a.work_dir}")
         return paths
 
-    ok = True
-    for month in months:
+    return 0 if settle_months(release_repo, months, a.work_dir, budget, now, produce, tag) else 1
+
+
+def cmd_sweep(a):
+    """Archive every listed repository, each into the release named after it."""
+    if not read_token():
+        return token_missing()
+    now = utcnow()
+    months = months_to_archive(a.month, now)
+    listed, left_out = read_repos_file(a.repos_file)
+    if a.only and a.only not in listed:
+        raise UsageError(f"{a.only} is not a repository listed in {a.repos_file}")
+    names = [a.only] if a.only else listed
+    budget, failed = Budget(), []
+    check_private(a.release_repo, budget, a.command)
+    for name in names:
+        source, work = f"{a.owner}/{name}", os.path.join(a.work_dir, name)
+        print(f"::group::{source}", flush=True)
         try:
-            ok &= settle_month(a.repo, month, a.work_dir, budget, now, produce)
-        except (GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
-            print(f"::error::{month}: {e}", flush=True)
+            ok = archive_repo(source, a.release_repo, name, months, work, budget, now)
+        except (Refused, GhError, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+            print(f"::error::{name}: {str(e).removeprefix(source + ': ')}", flush=True)
             ok = False
-    return 0 if ok else 1
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            print("::endgroup::", flush=True)
+        if not ok:
+            failed.append(name)
+    unchecked = False
+    try:
+        unlisted = unlisted_repos(a.owner, set(listed) | set(left_out), budget)
+    except (Refused, GhError) as e:
+        print(f"::error::the public repositories of {a.owner} could not be checked against "
+              f"{a.repos_file}: {e}", flush=True)
+        unlisted, unchecked = [], True
+    for name in unlisted:
+        print(f"::error::{a.owner}/{name} is public and has workflow runs but is not in "
+              f"{a.repos_file}; add {name} to archive it or !{name} to leave it out", flush=True)
+    if failed:
+        print(f"::error::sweep: not archived this run: {', '.join(failed)}", flush=True)
+    print(f"sweep: {len(names)} repositories, {len(names) - len(failed)} archived, {len(failed)} not; "
+          f"{len(unlisted)} not in the list", flush=True)
+    return 1 if failed or unlisted or unchecked else 0
+
+
+def cmd_check_token(a):
+    """Exit 1 when the read token is missing or refused, or expires within --min-days."""
+    if not read_token():
+        return token_missing()
+    args = ["api", "-i", "rate_limit"]
+    for n in range(1, TRIES + 1):
+        try:
+            reply = gh(args, source=True).decode("utf-8", "replace")
+            break
+        except GhError as e:
+            if e.status == 401:
+                print(f"::error::the read token {READ_TOKEN} is expired or revoked: GitHub answered "
+                      f"{e.text.strip().removeprefix('gh: ')[:120]}", flush=True)
+                return 1
+            if is_refusal(e) or n == TRIES:
+                print(f"::error::the read token {READ_TOKEN} could not be checked: {e}", flush=True)
+                return 1
+            sleep(BACKOFF_S[n - 1])
+    expiry = response_headers(reply).get(EXPIRY_HEADER)
+    if expiry is None:
+        print(f"the read token {READ_TOKEN} is accepted and has no expiry date", flush=True)
+        return 0
+    try:
+        when = parse_expiry(expiry)
+    except ValueError as e:
+        if a.min_days is not None:
+            raise
+        print(f"::warning::the read token {READ_TOKEN} is accepted, but {e}", flush=True)
+        return 0
+    days = int((when - utcnow()).total_seconds() // 86400)
+    day = when.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+    if a.min_days is not None and days < a.min_days:
+        print(f"::error::the read token {READ_TOKEN} expires on {day} ({days} days left, fewer than "
+              f"{a.min_days}); regenerate it and set the secret again", flush=True)
+        return 1
+    print(f"the read token {READ_TOKEN} is accepted and expires on {day} ({days} days left)", flush=True)
+    return 0
 
 
 def cmd_keepalive(a):
-    """Re-enabling a workflow restarts GitHub's 60-day inactivity clock for it."""
+    """Re-enabling a workflow restarts GitHub's 60-day inactivity clock for it.
+
+    No call carries the read token, so the schedule outlives a read token that is refused.
+    """
     path = a.workflow_ref.split("@", 1)[0]
     prefix = f"{a.repo}/.github/workflows/"
     name = path[len(prefix):] if path.startswith(prefix) else ""
     if not re.fullmatch(r"[A-Za-z0-9._-]+\.ya?ml", name):
         raise UsageError(f"{a.workflow_ref!r} is not a workflow of {a.repo}")
     with_retries(lambda: gh(["api", "-X", "PUT", f"repos/{a.repo}/actions/workflows/{name}/enable"]),
-                 Budget())
+                 Budget(source=False))
     print(f"re-enabled {name}", flush=True)
     return 0
 
@@ -672,23 +985,36 @@ def main(argv=None):
     sub = p.add_subparsers(dest="command", required=True)
     for name in ("archive", "build", "upload"):
         s = sub.add_parser(name)
-        s.add_argument("--repo", required=True, help="owner/name")
+        s.add_argument("--repo", required=True, help="owner/name whose runs are archived")
         s.add_argument("--month", action="append", default=[], help="YYYY-MM; repeatable")
         s.add_argument("--work-dir", required=True)
         if name == "build":
             s.add_argument("--cache-dir", help="zips saved earlier as <created>_<run id>_<workflow>.zip")
+        else:
+            s.add_argument("--release-repo", help="owner/name that holds the release; --repo when omitted")
+            s.add_argument("--tag", help=f"tag of the release; {TAG} when omitted, and required when "
+                                         "--release-repo is not --repo")
+    w = sub.add_parser("sweep")
+    w.add_argument("--owner", required=True, help="owner of every repository in the file")
+    w.add_argument("--repos-file", required=True, help="one name per line; !name is left out on purpose")
+    w.add_argument("--release-repo", required=True, help="owner/name that holds one release per repository")
+    w.add_argument("--work-dir", required=True)
+    w.add_argument("--month", action="append", default=[], help="YYYY-MM; repeatable")
+    w.add_argument("--only", help="archive just this listed repository")
+    c = sub.add_parser("check-token")
+    c.add_argument("--min-days", type=int, help="also fail when the token expires in fewer days")
     k = sub.add_parser("keepalive")
     k.add_argument("--repo", required=True)
     k.add_argument("--workflow-ref", required=True)
     a = p.parse_args(argv)
-    commands = {"archive": cmd_archive, "build": cmd_build, "upload": cmd_upload,
-                "keepalive": cmd_keepalive}
+    commands = {"archive": cmd_archive, "build": cmd_build, "upload": cmd_upload, "sweep": cmd_sweep,
+                "check-token": cmd_check_token, "keepalive": cmd_keepalive}
     try:
         return commands[a.command](a)
     except UsageError as e:
         print(f"::error::{e}", flush=True)
         return 2
-    except (GhError, BudgetUnreadable, RuntimeError, ValueError, OSError) as e:
+    except (GhError, Refused, BudgetUnreadable, RuntimeError, ValueError, OSError) as e:
         print(f"::error::{e}", flush=True)
         return 1
 
