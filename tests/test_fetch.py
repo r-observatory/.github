@@ -86,6 +86,63 @@ class Budget(Harness):
         self.assertEqual(self.slept, [self.reset - int(self.now.timestamp()) + 5])
 
 
+class UnreadableBudget(Harness):
+    def rate_reads(self):
+        return len(self.calls("api", "rate_limit"))
+
+    def test_a_failed_budget_read_is_tried_again(self):
+        self.put(runs=[run(1, "2026-08-02T06:00:00Z")], rate_error={"status": 502, "times": 2})
+
+        self.assertEqual(self.collect()[0]["outcome"], "ok")
+        self.assertEqual(self.rate_reads(), 3)
+        self.assertEqual(self.slept, [10, 30])
+
+    def test_a_budget_that_stays_unreadable_stops_before_any_other_call(self):
+        self.put(runs=[run(1, "2026-08-02T06:00:00Z")], rate_error={"status": 502})
+
+        with self.assertRaises(acl.BudgetUnreadable) as caught:
+            self.collect()
+
+        self.assertIn("HTTP 502", str(caught.exception))
+        self.assertEqual(self.calls(), [["api", "rate_limit"]] * 3)
+        self.assertEqual(self.slept, [10, 30])
+
+    def test_a_reply_without_the_remaining_count_is_unreadable(self):
+        self.put(rate={"limit": 5000})
+
+        with self.assertRaises(acl.BudgetUnreadable):
+            acl.Budget().spend()
+
+        self.assertEqual(self.rate_reads(), 3)
+
+    def test_no_call_is_let_through_until_the_budget_reads_again(self):
+        budget = acl.Budget(every=2)
+        budget.spend()
+        budget.spend()
+        self.put(rate_error={"status": 502})
+
+        for _ in range(2):
+            with self.assertRaises(acl.BudgetUnreadable):
+                budget.spend()
+        self.assertEqual(budget.calls, 2)
+
+        self.put(rate_error=None)
+        budget.spend()
+        self.assertEqual(budget.calls, 3)
+
+    def test_an_unreadable_budget_after_a_rate_limited_call_stops_the_fetch(self):
+        self.put(runs=[run(9, "2026-08-02T06:00:00Z")],
+                 logs={"9/1": {"status": 403, "times": 1,
+                               "message": "You have exceeded a secondary rate limit"}},
+                 rate_error={"status": 502, "skip": 1})
+
+        with self.assertRaises(acl.BudgetUnreadable):
+            self.collect()
+
+        self.assertEqual(len(self.api_calls("/logs")), 1)
+        self.assertEqual(self.slept, [10, 30])
+
+
 class LocalCopy(Harness):
     def test_a_local_zip_stands_in_only_for_the_attempt_it_holds(self):
         cache = os.path.join(self.tmp, "local")

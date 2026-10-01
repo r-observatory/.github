@@ -147,6 +147,10 @@ def gh_json(args):
     return json.loads(gh(args) or b"null")
 
 
+class BudgetUnreadable(Exception):
+    """The rate limit could not be read; the run stops rather than go on unchecked."""
+
+
 class Budget:
     """Leaves a reserve of the hourly API budget to the repository's own workflows."""
 
@@ -154,15 +158,27 @@ class Budget:
         self.floor, self.every, self.calls = floor, every, 0
 
     def core(self):
-        try:
-            return gh_json(["api", "rate_limit"])["resources"]["core"]
-        except (GhError, KeyError, TypeError, ValueError):
-            return None
+        """The core rate limit, read up to TRIES times."""
+        args = ["api", "rate_limit"]
+        for n in range(1, TRIES + 1):
+            try:
+                core = gh_json(args)["resources"]["core"]
+                return {k: int(core[k]) for k in ("limit", "remaining", "reset")}
+            except GhError as e:
+                why = str(e)
+            except (KeyError, TypeError, ValueError):
+                why = f"gh {' '.join(args)}: the reply did not give the core limit"
+            if n < TRIES:
+                print(f"the API budget could not be read ({why}); trying again in "
+                      f"{BACKOFF_S[n - 1]} s", flush=True)
+                sleep(BACKOFF_S[n - 1])
+        raise BudgetUnreadable(f"the API budget could not be read in {TRIES} tries ({why}); "
+                               "stopping, because the reserve cannot be checked")
 
     def spend(self):
         if self.calls % self.every == 0:
             core = self.core()
-            if core and core["remaining"] < self.floor:
+            if core["remaining"] < self.floor:
                 self.wait_for_reset(core)
         self.calls += 1
 
@@ -174,7 +190,7 @@ class Budget:
 
     def after_limit(self):
         core = self.core()
-        if core and core["remaining"] < self.floor:
+        if core["remaining"] < self.floor:
             self.wait_for_reset(core)
         else:
             sleep(60)
@@ -653,7 +669,7 @@ def main(argv=None):
     except UsageError as e:
         print(f"::error::{e}", flush=True)
         return 2
-    except (GhError, RuntimeError, ValueError, OSError) as e:
+    except (GhError, BudgetUnreadable, RuntimeError, ValueError, OSError) as e:
         print(f"::error::{e}", flush=True)
         return 1
 

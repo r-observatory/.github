@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import tarfile
 import unittest
@@ -64,6 +66,23 @@ class Archive(Harness):
             inner = tar.extractfile("index.tsv").read()
         with open(os.path.join(self.store, AUG[1]), "rb") as f:
             self.assertEqual(f.read(), inner)
+
+    def test_a_budget_that_cannot_be_read_stops_the_run_and_says_why(self):
+        self.put(runs=[run(i, f"2026-08-02T06:{i:02d}:00Z") for i in range(1, 31)]
+                 + [run(40, "2026-09-02T06:00:00Z")],
+                 rate_error={"status": 502, "skip": 1, "times": 3})
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            code = self.archive()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.calls("release", "upload"), [])
+        self.assertEqual(self.api_calls("created=2026-09"), [])
+        errors = [line for line in out.getvalue().splitlines() if line.startswith("::error::")]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("the API budget could not be read", errors[0])
+        self.assertIn("HTTP 502", errors[0])
 
     def test_an_open_month_is_refused(self):
         self.assertEqual(self.archive("--month", "2026-10"), 2)

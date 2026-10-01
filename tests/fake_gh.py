@@ -6,8 +6,10 @@ logs ("<id>/<n>": {"status", "times", "message", "body"}, a zip by default);
 release (null, or {"id", "assets": [{"name", "state"}]}); release_status (the
 HTTP status every tag lookup answers with); create_status (the status a create
 fails with) and create_race (the release exists all the same); rate ({"limit",
-"remaining", "reset"}, spent by every api call); fail_uploads (asset names whose
-upload fails); store (directory holding uploaded files); calls (every argv).
+"remaining", "reset"}, spent by every api call); rate_error ({"status", "skip",
+"times"}: after `skip` good reads the rate_limit call fails, `times` times or
+always); fail_uploads (asset names whose upload fails); store (directory
+holding uploaded files); calls (every argv).
 """
 import io
 import json
@@ -61,7 +63,14 @@ def api(state, args):
             i += 1
     path = rest[0]
     if path == "rate_limit":
-        core = state.get("rate") or {"limit": 5000, "remaining": 5000, "reset": 0}
+        err = state.get("rate_error")
+        if err and err.get("skip", 0) > 0:
+            err["skip"] -= 1
+        elif err and err.get("times", 1) > 0:
+            if "times" in err:
+                err["times"] -= 1
+            fail(state, err["status"], err.get("message", "Server Error"))
+        core =state.get("rate") or {"limit": 5000, "remaining": 5000, "reset": 0}
         reply(state, {"resources": {"core": core}})
     rate = state.get("rate")
     if rate:
