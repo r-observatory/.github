@@ -25,9 +25,9 @@ def at(s):
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def run(rid, created, attempt=1, name="Update", conclusion="success", updated=None):
+def run(rid, created, attempt=1, name="Update", conclusion="success", updated=None, status="completed"):
     return {"id": rid, "run_attempt": attempt, "name": name, "path": ".github/workflows/update.yml",
-            "event": "schedule", "status": "completed", "conclusion": conclusion,
+            "event": "schedule", "status": status, "conclusion": conclusion,
             "head_branch": "main", "head_sha": "a" * 40, "created_at": created,
             "run_started_at": created, "updated_at": updated or created}
 

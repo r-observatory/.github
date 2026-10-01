@@ -47,6 +47,7 @@ READ_TOKEN = "CI_LOGS_READ_TOKEN"
 EXPIRY_HEADER = "github-authentication-token-expiration"
 ACCESS_CHECK_DAYS = 85
 ACCESS_PROBES = 3
+ACCESS_PAGE = 30
 COLUMNS = ["run_id", "run_attempt", "workflow_name", "workflow_path", "event",
            "conclusion", "head_branch", "head_sha", "created_at",
            "run_started_at", "updated_at", "zip_bytes", "zip_sha256", "outcome"]
@@ -361,21 +362,36 @@ def fetch_log(repo, run_id, n, dest, budget):
         return "error"
 
 
+def newest_completed(repo, budget, floor):
+    """The first ACCESS_PROBES completed runs created after `floor`, newest first.
+
+    The listing is not filtered by status, because GitHub has answered that
+    filter with a part of the runs. The last page read is the first that is not
+    full or holds a run from before `floor`.
+    """
+    found, page = [], 1
+    while True:
+        q = f"repos/{repo}/actions/runs?per_page={ACCESS_PAGE}&page={page}"
+        runs = with_retries(lambda: gh_json(["api", q], source=True), budget).get("workflow_runs", [])
+        recent = [r for r in runs if parse_time(r["created_at"]) > floor]
+        found += [r for r in recent if r.get("status") == "completed"]
+        if len(found) >= ACCESS_PROBES or len(recent) < ACCESS_PAGE:
+            return found[:ACCESS_PROBES]
+        page += 1
+
+
 def check_access(repo, work_dir, budget, now):
     """Download one recent log, to show the credentials can read this repository's logs.
 
     Without access GitHub may answer 404, which fetch_log records as gone. A
-    repository whose newest completed runs are all older than ACCESS_CHECK_DAYS
-    has nothing to show and passes.
+    repository with no completed run newer than ACCESS_CHECK_DAYS has nothing
+    to show and passes.
     """
-    q = f"repos/{repo}/actions/runs?status=completed&per_page={ACCESS_PROBES}"
     try:
-        newest = with_retries(lambda: gh_json(["api", q], source=True), budget).get("workflow_runs", [])
+        recent = newest_completed(repo, budget, now - dt.timedelta(days=ACCESS_CHECK_DAYS))
     except GhError as e:
         raise Refused(f"{repo}: its runs could not be listed, so nothing is built or uploaded "
                       f"for it ({e})") from e
-    floor = now - dt.timedelta(days=ACCESS_CHECK_DAYS)
-    recent = [r for r in newest if parse_time(r["created_at"]) > floor]
     if not recent:
         return
     os.makedirs(work_dir, exist_ok=True)

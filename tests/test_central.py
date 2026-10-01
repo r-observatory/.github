@@ -300,6 +300,13 @@ class AccessCheck(Harness):
     def archive(self):
         return self.run_main("archive", "--repo", REPO, "--work-dir", self.work)
 
+    def listings(self):
+        """The run listings the check asked for: those not bounded by created."""
+        return [c[1] for c in self.calls("api") if "/actions/runs?" in c[1] and "created=" not in c[1]]
+
+    def page(self, n):
+        return f"repos/{REPO}/actions/runs?per_page=30&page={n}"
+
     def test_a_token_answered_404_for_every_log_stops_before_anything_is_listed_or_created(self):
         self.two_tokens(unselected={REPO: 404})
 
@@ -329,7 +336,7 @@ class AccessCheck(Harness):
         code, errors, _ = self.archive()
 
         self.assertEqual((code, errors), (0, []))
-        self.assertEqual(len(self.api_calls("per_page=3")), 1)
+        self.assertEqual(self.listings(), [self.page(1)])
         self.assertEqual(len(self.api_calls("runs/3/attempts/1/logs")), 1)
         self.assertEqual(len(self.api_calls("/logs")), 3)
         self.assertEqual(sorted(os.listdir(self.store)), sorted(AUG + SEP))
@@ -357,9 +364,64 @@ class AccessCheck(Harness):
         code, errors, _ = self.archive()
 
         self.assertEqual((code, errors), (0, []))
-        self.assertEqual(len(self.api_calls("per_page=3")), 1)
+        self.assertEqual(self.listings(), [self.page(1)])
         self.assertEqual(len(self.api_calls("/logs")), 1)
         self.assertEqual([r["outcome"] for r in self.index_rows("2026-08")], ["gone"])
+
+    def test_a_listing_filtered_by_status_that_answers_old_runs_only_hides_no_recent_run(self):
+        # GitHub has answered ?status=completed with a part of the runs, here none newer than June.
+        self.two_tokens(unselected={REPO: 404})
+        self.put(partial=[run(90, "2026-06-29T06:00:00Z"), run(89, "2026-06-27T06:00:00Z"),
+                          run(88, "2026-06-27T05:00:00Z")])
+
+        code, errors, _ = self.archive()
+
+        self.assertEqual(code, 1)
+        self.assertIn("no log of its newest runs could be downloaded "
+                      "(run 3 gone, run 2 gone, run 1 gone)", errors[0])
+        self.assertEqual(self.calls("release"), [])
+        self.assertEqual(os.listdir(self.store), [])
+
+    def test_a_run_that_has_not_completed_is_passed_over(self):
+        self.put(runs=self.state()["runs"] + [run(4, "2026-10-06T03:00:00Z", status="in_progress")])
+
+        code, _, _ = self.archive()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.api_calls("runs/4/"), [])
+        self.assertEqual(len(self.api_calls("runs/3/attempts/1/logs")), 1)
+
+    def test_a_page_of_runs_still_going_is_followed_by_the_next_page(self):
+        self.two_tokens(unselected={REPO: 404})
+        going = [run(100 + i, f"2026-10-06T03:{i:02d}:00Z", status="in_progress") for i in range(30)]
+        self.put(runs=self.state()["runs"] + going)
+
+        code, errors, _ = self.archive()
+
+        self.assertEqual(code, 1)
+        self.assertIn("(run 3 gone, run 2 gone, run 1 gone)", errors[0])
+        self.assertEqual(self.listings(), [self.page(1), self.page(2)])
+
+    def test_three_logs_are_tried_and_a_full_page_that_holds_them_is_the_last(self):
+        self.two_tokens(unselected={REPO: 404})
+        more = [run(100 + i, f"2026-10-05T07:{i:02d}:00Z") for i in range(30)]
+        self.put(runs=self.state()["runs"] + more)
+
+        _, errors, _ = self.archive()
+
+        self.assertIn("(run 129 gone, run 128 gone, run 127 gone)", errors[0])
+        self.assertEqual(len(self.api_calls("/logs")), 3)
+        self.assertEqual(self.listings(), [self.page(1)])
+
+    def test_the_listing_stops_at_the_page_that_reaches_past_85_days(self):
+        old = [run(100 + i, f"2026-06-{i + 1:02d}T06:00:00Z") for i in range(30)]
+        self.put(runs=[run(3, "2026-10-05T06:00:00Z")] + old)
+
+        code, _, _ = self.archive()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.listings(), [self.page(1)])
+        self.assertEqual(len(self.api_calls("/logs")), 1)
 
     def test_runs_that_cannot_be_listed_stop_the_repository(self):
         code, errors, _ = self.run_main("archive", "--repo", "r-observatory/typo", "--release-repo", REPO,

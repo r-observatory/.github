@@ -2,7 +2,9 @@
 """A stand-in for gh that serves the JSON file in FAKE_GH_STATE.
 
 State keys: repo (the source repository, and the one holding the release unless
-release_repo names another); runs (run objects); attempts ("<id>/<n>": attempt
+release_repo names another); runs (run objects); partial (the runs a listing
+filtered by status and not bounded by created answers with, in place of the
+real ones, as GitHub has done); attempts ("<id>/<n>": attempt
 object); logs ("<id>/<n>": {"status", "times", "message", "body"}, a zip by
 default); sources ({"owner/name": {"runs", "attempts", "logs"}}: further source
 repositories); release (the ci-logs release: null, or {"id", "assets": [{"name",
@@ -180,7 +182,12 @@ def api(state, args):
         src = source(state, m.group(1))
         if src is None:
             fail(state, 404, "Not Found")
-        runs = sorted(src.get("runs", []), key=lambda r: r["created_at"], reverse=True)
+        runs = src.get("runs", [])
+        if "status" in q:
+            if "created" not in q:
+                runs = src.get("partial", runs)
+            runs = [r for r in runs if r["status"] == q["status"]]
+        runs = sorted(runs, key=lambda r: r["created_at"], reverse=True)
         if "created" in q:
             a, b = q["created"].split("..")
             runs = [r for r in runs if a <= r["created_at"] <= b]
