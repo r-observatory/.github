@@ -229,3 +229,124 @@ def list_runs(repo, month, budget):
             if start <= parse_time(r["created_at"]) < end:
                 runs[r["id"]] = r
     return sorted(runs.values(), key=lambda r: (r["created_at"], r["id"]))
+
+
+# --- fetching ---------------------------------------------------------------
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].strip("-") or "workflow"
+
+
+def member_name(row):
+    created = str(row["created_at"])[:19].replace(":", "")
+    return (f"{created}_{row['run_id']}_a{row['run_attempt']}_"
+            f"{slug(str(row['workflow_name']))}_{row['conclusion'] or 'none'}.zip")
+
+
+def attempt_meta(repo, run, n, budget):
+    if n == run["run_attempt"]:
+        return run
+    try:
+        return with_retries(
+            lambda: gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/attempts/{n}"]), budget)
+    except GhError:
+        return dict(run, conclusion=None, run_started_at=None, updated_at=None)
+
+
+def row_for(run, meta, n):
+    return {"run_id": run["id"], "run_attempt": n,
+            "workflow_name": run.get("name") or "", "workflow_path": run.get("path") or "",
+            "event": run.get("event") or "", "conclusion": meta.get("conclusion") or "",
+            "head_branch": run.get("head_branch") or "", "head_sha": run.get("head_sha") or "",
+            "created_at": run.get("created_at") or "",
+            "run_started_at": meta.get("run_started_at") or "",
+            "updated_at": meta.get("updated_at") or "",
+            "zip_bytes": "", "zip_sha256": "", "outcome": ""}
+
+
+def remove(path):
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def fetch_log(repo, run_id, n, dest, budget):
+    """'ok' with the zip at dest, 'gone' when GitHub no longer has it, else 'error'."""
+    args = ["api", f"repos/{repo}/actions/runs/{run_id}/attempts/{n}/logs"]
+
+    def once():
+        try:
+            gh(args, out=dest)
+        except GhError:
+            remove(dest)
+            raise
+        if not zipfile.is_zipfile(dest):
+            remove(dest)
+            raise GhError(args, None, "the response was not a zip archive")
+
+    try:
+        with_retries(once, budget)
+        return "ok"
+    except GhError as e:
+        if e.status in (404, 410):
+            return "gone"
+        print(f"::warning::run {run_id} attempt {n}: {e.text.strip()[:200]}", flush=True)
+        return "error"
+
+
+def cache_index(cache_dir):
+    """Zips an earlier local fetch saved as <created>_<run id>_<workflow>.zip, by run id."""
+    out = {}
+    if cache_dir:
+        for name in os.listdir(cache_dir):
+            m = LOCAL_NAME.match(name)
+            if m:
+                out[int(m.group(1))] = os.path.join(cache_dir, name)
+    return out
+
+
+def cached_zip(cache, run, n):
+    """The saved zip, when it holds this attempt: the latest one, saved after it ended."""
+    path = cache.get(run["id"])
+    if not path or n != run["run_attempt"] or not run.get("updated_at"):
+        return None
+    if os.path.getmtime(path) < parse_time(run["updated_at"]).timestamp():
+        return None
+    return path if zipfile.is_zipfile(path) else None
+
+
+def file_digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return os.path.getsize(path), h.hexdigest()
+
+
+def collect_month(repo, month, work_dir, budget, cache=None):
+    """Every attempt of every completed run in the month, zips in <work>/<month>/zips."""
+    zips = os.path.join(work_dir, month, "zips")
+    os.makedirs(zips, exist_ok=True)
+    have = {}
+    for name in os.listdir(zips):
+        m = MEMBER_NAME.match(name)
+        if m:
+            have[(int(m.group(1)), int(m.group(2)))] = os.path.join(zips, name)
+    rows = []
+    for run in list_runs(repo, month, budget):
+        for n in range(1, int(run["run_attempt"]) + 1):
+            row = row_for(run, attempt_meta(repo, run, n, budget), n)
+            dest = os.path.join(zips, member_name(row))
+            prior = have.get((run["id"], n))
+            local = cached_zip(cache or {}, run, n)
+            if prior and zipfile.is_zipfile(prior):
+                os.replace(prior, dest)
+                row["outcome"] = "ok"
+            elif local:
+                shutil.copyfile(local, dest)
+                row["outcome"] = "ok"
+            else:
+                row["outcome"] = fetch_log(repo, run["id"], n, dest, budget)
+            if row["outcome"] == "ok":
+                row["zip_bytes"], row["zip_sha256"] = file_digest(dest)
+            rows.append(row)
+    return rows
