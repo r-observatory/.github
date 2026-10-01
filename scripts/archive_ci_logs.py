@@ -114,3 +114,118 @@ def day_slices(month, days=SLICE_DAYS):
         out.append((a, b))
         a = b + dt.timedelta(days=1)
     return out
+
+
+# --- gh, the API budget and retries ----------------------------------------
+
+class GhError(Exception):
+    def __init__(self, args, status, text):
+        super().__init__(f"gh {' '.join(args)}: {text.strip()[:300]}")
+        self.status = status
+        self.text = text
+
+
+def http_status(text):
+    m = re.search(r"\(HTTP (\d{3})\)", text)
+    return int(m.group(1)) if m else None
+
+
+def gh(args, out=None):
+    """Run gh and return its stdout, or write stdout to the path `out`."""
+    if out is None:
+        p = subprocess.run(["gh"] + args, capture_output=True)
+    else:
+        with open(out, "wb") as f:
+            p = subprocess.run(["gh"] + args, stdout=f, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        text = p.stderr.decode("utf-8", "replace")
+        raise GhError(args, http_status(text), text)
+    return p.stdout or b""
+
+
+def gh_json(args):
+    return json.loads(gh(args) or b"null")
+
+
+class Budget:
+    """Leaves a reserve of the hourly API budget to the repository's own workflows."""
+
+    def __init__(self, floor=BUDGET_FLOOR, every=BUDGET_EVERY):
+        self.floor, self.every, self.calls = floor, every, 0
+
+    def core(self):
+        try:
+            return gh_json(["api", "rate_limit"])["resources"]["core"]
+        except (GhError, KeyError, TypeError, ValueError):
+            return None
+
+    def spend(self):
+        if self.calls % self.every == 0:
+            core = self.core()
+            if core and core["remaining"] < self.floor:
+                self.wait_for_reset(core)
+        self.calls += 1
+
+    def wait_for_reset(self, core):
+        wait = max(0, int(core["reset"] - utcnow().timestamp())) + 5
+        print(f"API budget at {core['remaining']} of {core['limit']}; waiting {wait} s for the reset",
+              flush=True)
+        sleep(wait)
+
+    def after_limit(self):
+        core = self.core()
+        if core and core["remaining"] < self.floor:
+            self.wait_for_reset(core)
+        else:
+            sleep(60)
+
+
+def with_retries(fn, budget):
+    """fn() through transient failures; 404 and 410 are raised at once."""
+    for n in range(1, TRIES + 1):
+        budget.spend()
+        try:
+            return fn()
+        except GhError as e:
+            if e.status in (404, 410) or n == TRIES:
+                raise
+            if e.status == 429 or "rate limit" in e.text.lower():
+                budget.after_limit()
+            else:
+                sleep(BACKOFF_S[n - 1])
+
+
+# --- listing ----------------------------------------------------------------
+
+def list_slice(repo, a, b, budget):
+    q = (f"repos/{repo}/actions/runs?status=completed&exclude_pull_requests=true"
+         f"&per_page=100&created={a.isoformat()}T00:00:00Z..{b.isoformat()}T23:59:59Z")
+    got, total, page = [], 0, 1
+    while True:
+        body = with_retries(lambda: gh_json(["api", f"{q}&page={page}"]), budget)
+        if page == 1:
+            total = body.get("total_count", 0)
+        batch = body.get("workflow_runs", [])
+        got.extend(batch)
+        if total > LIST_CAP or len(batch) < 100 or len(got) >= LIST_CAP:
+            return got, total
+        page += 1
+
+
+def list_runs(repo, month, budget):
+    """Every completed run created in the month, each once, oldest first."""
+    start, end = month_bounds(month)
+    runs, pending = {}, day_slices(month)
+    while pending:
+        a, b = pending.pop(0)
+        got, total = list_slice(repo, a, b, budget)
+        if total > LIST_CAP or len(got) >= LIST_CAP:
+            if a == b:
+                raise RuntimeError(f"more than {LIST_CAP} runs on {a}; the listing cannot reach them all")
+            days = [(a + dt.timedelta(days=i),) * 2 for i in range((b - a).days + 1)]
+            pending = days + pending
+            continue
+        for r in got:
+            if start <= parse_time(r["created_at"]) < end:
+                runs[r["id"]] = r
+    return sorted(runs.values(), key=lambda r: (r["created_at"], r["id"]))
